@@ -1,14 +1,18 @@
-name: Trakt to NeoDB Sync
+name: 豆瓣 → NeoDB 同步
 
 on:
   schedule:
-    # 每3天 UTC 02:00 运行
-    - cron: '0 2 */3 * *'
+    # 每 6 小时跑一次（UTC 0/6/12/18 点），豆瓣 RSS 只保留最近 10 条，跑勤一点防漏
+    - cron: "0 0,6,12,18 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    name: 同步豆瓣标记到 NeoDB
 
     steps:
       - name: Checkout
@@ -17,31 +21,25 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Restore last sync timestamp
-        uses: actions/cache@v4
-        with:
-          path: .last_sync
-          key: last-sync-${{ github.run_id }}
-          restore-keys: |
-            last-sync-
+          python-version: "3.x"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install requests
 
       - name: Run sync
         env:
-          TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
-          TRAKT_ACCESS_TOKEN: ${{ secrets.TRAKT_ACCESS_TOKEN }}
-          NEODB_ACCESS_TOKEN: ${{ secrets.NEODB_ACCESS_TOKEN }}
-          TRAKT_USERNAME: ${{ secrets.TRAKT_USERNAME }}
+          DOUBAN_ID: ${{ secrets.DOUBAN_ID }}
+          NEODB_TOKEN: ${{ secrets.NEODB_TOKEN }}
         run: python sync.py
+
+      - name: Commit synced record
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add synced.json
+          if git diff --cached --quiet; then
+            echo "没有新的同步记录"
+          else
+            git commit -m "chore: update synced.json"
+            git push
+          fi
