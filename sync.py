@@ -1,270 +1,163 @@
-#!/usr/bin/env python3
-"""Trakt to NeoDB 同步脚本。
-
-从 Trakt 拉取观影历史（电影和剧集），同步到 NeoDB 标记为"看过"。
-通过 last_sync 时间戳实现增量同步，避免重复。
+"""
+douban-neodb-sync: 豆瓣 RSS → NeoDB 自动同步
+每次运行只处理上次运行后新增的条目，已同步的条目记录在 synced.json 中。
 """
 
 import os
-import sys
-import datetime
+import json
+import time
+import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import requests
 
-# ── 配置（从环境变量读取）──
-TRAKT_CLIENT_ID = os.environ.get("TRAKT_CLIENT_ID", "")
-TRAKT_ACCESS_TOKEN = os.environ.get("TRAKT_ACCESS_TOKEN", "")
-NEODB_ACCESS_TOKEN = os.environ.get("NEODB_ACCESS_TOKEN", "")
-TRAKT_USERNAME = os.environ.get("TRAKT_USERNAME", "")
+# ── 配置 ──────────────────────────────────────────────────────────────────────
+DOUBAN_ID = os.environ["DOUBAN_ID"]
+NEODB_TOKEN = os.environ["NEODB_TOKEN"]
+NEODB_BASE = "https://neodb.social"
+SYNCED_FILE = Path("synced.json")
 
-# ── API 端点 ──
-TRAKT_API_BASE = "https://api.trakt.tv"
-NEODB_API_BASE = "https://neodb.social/api"
+# 豆瓣 RSS：包含电影、剧集、书籍、音乐等所有"看过/读过/听过"标记
+RSS_URL = f"https://www.douban.com/feed/people/{DOUBAN_ID}/interests"
 
-# ── last_sync 时间戳文件 ──
-LAST_SYNC_FILE = Path(__file__).parent / ".last_sync"
+# NeoDB shelf 类型
+SHELF_TYPE = "complete"  # 豆瓣"看过/读过/听过" → NeoDB complete
 
+# 豆瓣评分（1-5星）→ NeoDB 评分（0-10）
+RATING_MAP = {"1": 2, "2": 4, "3": 6, "4": 8, "5": 10}
 
-def log(msg: str) -> None:
-    """打印带时间戳的日志。"""
-    ts = datetime.datetime.now().isoformat()
-    print(f"[{ts}] {msg}")
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; douban-neodb-sync/1.0)",
+}
 
-
-# ── Trakt API ──
-
-def trakt_headers() -> dict:
-    return {
-        "Content-Type": "application/json",
-        "trakt-api-version": "2",
-        "trakt-api-key": TRAKT_CLIENT_ID,
-        "Authorization": f"Bearer {TRAKT_ACCESS_TOKEN}",
-    }
+NEODB_HEADERS = {
+    "Authorization": f"Bearer {NEODB_TOKEN}",
+    "Content-Type": "application/json",
+}
 
 
-def fetch_trakt_history(history_type: str, start_at: str | None = None) -> list:
-    """从 Trakt 拉取观影历史。
-
-    Args:
-        history_type: 'movies' 或 'shows'
-        start_at: ISO 时间戳，仅拉取此时间之后的记录
-
-    Returns:
-        历史记录列表
-    """
-    url = f"{TRAKT_API_BASE}/users/{TRAKT_USERNAME}/history/{history_type}"
-    params = {"limit": 100}
-    if start_at:
-        params["start_at"] = start_at
-
-    all_entries: list = []
-    page = 1
-
-    while True:
-        params["page"] = page
-        log(f"  Trakt {history_type} 历史 — 第 {page} 页")
-        resp = requests.get(url, headers=trakt_headers(), params=params, timeout=30)
-        resp.raise_for_status()
-        entries = resp.json()
-
-        if not entries:
-            break
-        all_entries.extend(entries)
-
-        total_pages = int(resp.headers.get("X-Pagination-Page-Count", "1"))
-        if page >= total_pages or len(entries) < 100:
-            break
-        page += 1
-
-    return all_entries
+def load_synced() -> set:
+    if SYNCED_FILE.exists():
+        return set(json.loads(SYNCED_FILE.read_text()))
+    return set()
 
 
-# ── NeoDB API ──
-
-def neodb_headers() -> dict:
-    return {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {NEODB_ACCESS_TOKEN}",
-    }
+def save_synced(synced: set):
+    SYNCED_FILE.write_text(json.dumps(sorted(synced), ensure_ascii=False, indent=2))
 
 
-def search_neodb(title: str, category: str) -> str | None:
-    """在 NeoDB 搜索条目，返回首个匹配的 UUID。"""
-    url = f"{NEODB_API_BASE}/catalog/search"
-    params = {"query": title, "category": category}
-    resp = requests.get(url, headers=neodb_headers(), params=params, timeout=30)
+def fetch_rss() -> list[dict]:
+    """拉取豆瓣 RSS，返回条目列表（最新在前）。"""
+    resp = requests.get(RSS_URL, headers=HEADERS, timeout=30)
     resp.raise_for_status()
-    data = resp.json()
+    root = ET.fromstring(resp.content)
+    items = []
+    for item in root.iter("item"):
+        title = item.findtext("title", "").strip()
+        link = item.findtext("link", "").strip()
+        pub_date = item.findtext("pubDate", "").strip()
+        content = item.findtext("description", "")
 
-    # 兼容 list / dict 两种返回格式
-    if isinstance(data, list):
-        results = data
-    elif isinstance(data, dict):
-        results = data.get("data", [])
-    else:
-        results = []
+        # 只处理"看过/读过/听过/玩过"，跳过"想看/在看"等
+        if not any(k in content for k in ["看过", "读过", "听过", "玩过"]):
+            continue
 
-    if results:
-        item = results[0]
-        return item.get("uuid") or item.get("item_uuid") or item.get("id")
+        # 解析评分（推荐: 力荐/推荐/还行/较差/很差）
+        rating = None
+        rating_match = re.search(r"推荐:\s*(力荐|推荐|还行|较差|很差)", content)
+        if rating_match:
+            rating_text = rating_match.group(1)
+            rating_map_cn = {"力荐": "5", "推荐": "4", "还行": "3", "较差": "2", "很差": "1"}
+            rating = RATING_MAP.get(rating_map_cn.get(rating_text, ""), None)
+
+        # 解析短评
+        comment = None
+        comment_match = re.search(r"备注:\s*(.+?)(?:\s*<|$)", content, re.DOTALL)
+        if comment_match:
+            comment = comment_match.group(1).strip()
+
+        # 豆瓣条目链接
+        douban_url = link
+        url_match = re.search(r'href="(https?://(?:movie|book|music|www)\.douban\.com/subject/\d+/)"', content)
+        if url_match:
+            douban_url = url_match.group(1)
+
+        items.append({
+            "title": title,
+            "douban_url": douban_url,
+            "pub_date": pub_date,
+            "rating": rating,
+            "comment": comment,
+        })
+    return items
+
+
+def search_neodb(douban_url: str) -> str | None:
+    """用豆瓣 URL 在 NeoDB 搜索对应条目，返回 NeoDB item UUID。"""
+    resp = requests.get(
+        f"{NEODB_BASE}/api/catalog/fetch",
+        params={"url": douban_url},
+        headers=NEODB_HEADERS,
+        timeout=30,
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        return data.get("uuid")
     return None
 
 
-def mark_neodb_watched(item_uuid: str, watched_at: str) -> bool:
-    """在 NeoDB 标记条目为"看过"。"""
-    url = f"{NEODB_API_BASE}/me/shelf/complete"
-    body = {
-        "item_uuid": item_uuid,
-        "rating_grade": None,
-        "text": "",
-        "created_time": watched_at,
-    }
-    resp = requests.post(url, headers=neodb_headers(), json=body, timeout=30)
+def mark_neodb(uuid: str, rating: int | None, comment: str | None) -> bool:
+    """在 NeoDB 标记条目为 complete，附带评分和短评。"""
+    payload = {"shelf_type": SHELF_TYPE, "visibility": 0}
+    if rating is not None:
+        payload["rating_grade"] = rating
+    if comment:
+        payload["comment_text"] = comment
 
-    if resp.status_code in (200, 201):
-        return True
-    if resp.status_code == 409:
-        log("  已标记过，跳过")
-        return True
-    log(f"  标记失败: HTTP {resp.status_code} — {resp.text[:200]}")
-    return False
+    resp = requests.post(
+        f"{NEODB_BASE}/api/me/shelf/item/{uuid}",
+        headers=NEODB_HEADERS,
+        json=payload,
+        timeout=30,
+    )
+    return resp.status_code in (200, 201)
 
 
-# ── 同步逻辑 ──
+def main():
+    synced = load_synced()
+    items = fetch_rss()
+    print(f"RSS 获取到 {len(items)} 条已完成条目")
 
-def sync_movies(entries: list) -> tuple[int, int, int]:
-    """同步电影记录到 NeoDB。"""
-    success = failed = skipped = 0
+    new_count = 0
+    fail_count = 0
 
-    for entry in entries:
-        movie = entry.get("movie", {})
-        title = movie.get("title", "")
-        watched_at = entry.get("watched_at", "")
-
-        if not title:
-            skipped += 1
+    for item in items:
+        key = item["douban_url"]
+        if key in synced:
+            print(f"  跳过（已同步）: {item['title']}")
             continue
 
-        log(f"电影: {title} (观看于 {watched_at})")
-        try:
-            uuid = search_neodb(title, "movie")
-            if not uuid:
-                log("  NeoDB 未找到，跳过")
-                failed += 1
-                continue
-            if mark_neodb_watched(uuid, watched_at):
-                success += 1
-            else:
-                failed += 1
-        except Exception as e:
-            log(f"  异常: {e}")
-            failed += 1
-
-    return success, failed, skipped
-
-
-def sync_shows(entries: list) -> tuple[int, int, int]:
-    """同步剧集记录到 NeoDB（按剧名去重）。"""
-    success = failed = skipped = 0
-    seen: set[str] = set()
-
-    for entry in entries:
-        show = entry.get("show", {})
-        title = show.get("title", "")
-        watched_at = entry.get("watched_at", "")
-
-        if not title:
-            skipped += 1
-            continue
-        if title in seen:
-            skipped += 1
+        print(f"  处理: {item['title']} ({key})")
+        uuid = search_neodb(key)
+        if not uuid:
+            print(f"    ⚠️  NeoDB 未找到对应条目，跳过")
+            fail_count += 1
             continue
 
-        seen.add(title)
-        log(f"剧集: {title} (观看于 {watched_at})")
-        try:
-            uuid = search_neodb(title, "tv")
-            if not uuid:
-                log("  NeoDB 未找到，跳过")
-                failed += 1
-                continue
-            if mark_neodb_watched(uuid, watched_at):
-                success += 1
-            else:
-                failed += 1
-        except Exception as e:
-            log(f"  异常: {e}")
-            failed += 1
+        ok = mark_neodb(uuid, item["rating"], item["comment"])
+        if ok:
+            print(f"    ✅ 同步成功（评分={item['rating']}, 短评={'有' if item['comment'] else '无'}）")
+            synced.add(key)
+            new_count += 1
+        else:
+            print(f"    ❌ 同步失败")
+            fail_count += 1
 
-    return success, failed, skipped
+        time.sleep(1)  # 避免请求过快
 
-
-# ── last_sync 管理 ──
-
-def get_last_sync() -> str | None:
-    """读取上次同步时间戳。"""
-    if LAST_SYNC_FILE.exists():
-        ts = LAST_SYNC_FILE.read_text().strip()
-        if ts:
-            log(f"上次同步时间: {ts}")
-            return ts
-    log("未找到上次同步记录，将同步全部历史")
-    return None
-
-
-def save_last_sync(timestamp: str) -> None:
-    """保存同步时间戳。"""
-    LAST_SYNC_FILE.write_text(timestamp)
-    log(f"已保存同步时间: {timestamp}")
-
-
-# ── 主流程 ──
-
-def main() -> None:
-    # 校验环境变量
-    required = {
-        "TRAKT_CLIENT_ID": TRAKT_CLIENT_ID,
-        "TRAKT_ACCESS_TOKEN": TRAKT_ACCESS_TOKEN,
-        "NEODB_ACCESS_TOKEN": NEODB_ACCESS_TOKEN,
-        "TRAKT_USERNAME": TRAKT_USERNAME,
-    }
-    missing = [k for k, v in required.items() if not v]
-    if missing:
-        log(f"错误: 缺少环境变量: {', '.join(missing)}")
-        sys.exit(1)
-
-    log("=== Trakt → NeoDB 同步开始 ===")
-
-    last_sync = get_last_sync()
-    sync_start = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # 电影
-    log("--- 电影 ---")
-    try:
-        movie_entries = fetch_trakt_history("movies", start_at=last_sync)
-    except Exception as e:
-        log(f"获取电影历史失败: {e}")
-        movie_entries = []
-    m_ok, m_fail, m_skip = sync_movies(movie_entries)
-    log(f"电影完成: 成功 {m_ok}, 失败 {m_fail}, 跳过 {m_skip}")
-
-    # 剧集
-    log("--- 剧集 ---")
-    try:
-        show_entries = fetch_trakt_history("shows", start_at=last_sync)
-    except Exception as e:
-        log(f"获取剧集历史失败: {e}")
-        show_entries = []
-    s_ok, s_fail, s_skip = sync_shows(show_entries)
-    log(f"剧集完成: 成功 {s_ok}, 失败 {s_fail}, 跳过 {s_skip}")
-
-    save_last_sync(sync_start)
-
-    total_ok = m_ok + s_ok
-    total_fail = m_fail + s_fail
-    total_skip = m_skip + s_skip
-    log(f"=== 同步完成: 成功 {total_ok}, 失败 {total_fail}, 跳过 {total_skip} ===")
+    save_synced(synced)
+    print(f"\n完成：新同步 {new_count} 条，失败/未找到 {fail_count} 条")
 
 
 if __name__ == "__main__":
