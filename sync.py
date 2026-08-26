@@ -80,7 +80,7 @@ def fetch_rss() -> list[dict]:
         comment = None
         comment_match = re.search(r"备注:\s*(.+?)(?:\s*(?:<|\Z))", content, re.DOTALL)
         if comment_match:
-            comment = comment.group(1).strip()
+            comment = comment_match.group(1).strip()
 
         # 豆瓣条目链接直接在 <link> 里
         douban_url = link
