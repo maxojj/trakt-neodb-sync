@@ -2,8 +2,8 @@ name: 豆瓣 → NeoDB 同步
 
 on:
   schedule:
-    # 每 6 小时跑一次（UTC 0/6/12/18 点），豆瓣 RSS 只保留最近 10 条，跑勤一点防漏
-    - cron: "0 0,6,12,18 * * *"
+    # 每 2 天 UTC 02:00 执行一次（北京时间 10:00）
+    - cron: "0 2 */2 * *"
   workflow_dispatch:
 
 permissions:
