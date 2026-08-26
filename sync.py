@@ -18,11 +18,9 @@ NEODB_TOKEN = os.environ["NEODB_TOKEN"]
 NEODB_BASE = "https://neodb.social"
 SYNCED_FILE = Path("synced.json")
 
-# 豆瓣 RSS：包含电影、剧集、书籍、音乐等所有"看过/读过/听过"标记
 RSS_URL = f"https://www.douban.com/feed/people/{DOUBAN_ID}/interests"
 
-# NeoDB shelf 类型
-SHELF_TYPE = "complete"  # 豆瓣"看过/读过/听过" → NeoDB complete
+SHELF_TYPE = "complete"
 
 # 豆瓣评分（1-5星）→ NeoDB 评分（0-10）
 RATING_MAP = {"1": 2, "2": 4, "3": 6, "4": 8, "5": 10}
@@ -48,20 +46,27 @@ def save_synced(synced: set):
 
 
 def fetch_rss() -> list[dict]:
-    """拉取豆瓣 RSS，返回条目列表（最新在前）。"""
+    """拉取豆瓣 RSS，返回条目列表。"""
     resp = requests.get(RSS_URL, headers=HEADERS, timeout=30)
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
     items = []
     for item in root.iter("item"):
-        title = item.findtext("title", "").strip()
+        # 豆瓣 RSS 的 title 格式是"看过XXX"/"读过XXX"/"听过XXX"
+        title_full = item.findtext("title", "").strip()
         link = item.findtext("link", "").strip()
-        pub_date = item.findtext("pubDate", "").strip()
         content = item.findtext("description", "")
 
-        # 只处理"看过/读过/听过/玩过"，跳过"想看/在看"等
-        if not any(k in content for k in ["看过", "读过", "听过", "玩过"]):
+        # 通过 title 判断是否为"已完成"标记，跳过"想看/在看"等
+        if not any(title_full.startswith(k) for k in ["看过", "读过", "听过", "玩过"]):
             continue
+
+        # 去掉前缀，得到真实标题
+        title = title_full
+        for prefix in ["看过", "读过", "听过", "玩过"]:
+            if title_full.startswith(prefix):
+                title = title_full[len(prefix):]
+                break
 
         # 解析评分（推荐: 力荐/推荐/还行/较差/很差）
         rating = None
@@ -71,22 +76,18 @@ def fetch_rss() -> list[dict]:
             rating_map_cn = {"力荐": "5", "推荐": "4", "还行": "3", "较差": "2", "很差": "1"}
             rating = RATING_MAP.get(rating_map_cn.get(rating_text, ""), None)
 
-        # 解析短评
+        # 解析短评（备注字段）
         comment = None
-        comment_match = re.search(r"备注:\s*(.+?)(?:\s*<|$)", content, re.DOTALL)
+        comment_match = re.search(r"备注:\s*(.+?)(?:\s*(?:<|\Z))", content, re.DOTALL)
         if comment_match:
-            comment = comment_match.group(1).strip()
+            comment = comment.group(1).strip()
 
-        # 豆瓣条目链接
+        # 豆瓣条目链接直接在 <link> 里
         douban_url = link
-        url_match = re.search(r'href="(https?://(?:movie|book|music|www)\.douban\.com/subject/\d+/)"', content)
-        if url_match:
-            douban_url = url_match.group(1)
 
         items.append({
             "title": title,
             "douban_url": douban_url,
-            "pub_date": pub_date,
             "rating": rating,
             "comment": comment,
         })
@@ -94,7 +95,7 @@ def fetch_rss() -> list[dict]:
 
 
 def search_neodb(douban_url: str) -> str | None:
-    """用豆瓣 URL 在 NeoDB 搜索对应条目，返回 NeoDB item UUID。"""
+    """用豆瓣 URL 在 NeoDB 搜索对应条目，返回 UUID。"""
     resp = requests.get(
         f"{NEODB_BASE}/api/catalog/fetch",
         params={"url": douban_url},
@@ -154,7 +155,7 @@ def main():
             print(f"    ❌ 同步失败")
             fail_count += 1
 
-        time.sleep(1)  # 避免请求过快
+        time.sleep(1)
 
     save_synced(synced)
     print(f"\n完成：新同步 {new_count} 条，失败/未找到 {fail_count} 条")
