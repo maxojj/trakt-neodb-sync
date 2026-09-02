@@ -2,8 +2,8 @@ name: 豆瓣 → NeoDB 同步
 
 on:
   schedule:
-    # 每 2 天 UTC 02:00 执行一次（北京时间 10:00）
-    - cron: "0 2 */2 * *"
+    # 每3天北京时间凌晨1点运行 (UTC 17:00)
+    - cron: "0 17 */3 * *"
   workflow_dispatch:
 
 permissions:
